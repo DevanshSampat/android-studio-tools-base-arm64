@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Runs the bazel executable for the platform, passing args along."""
+
+import os
+import os.path
+import platform as plat
+import subprocess
+import sys
+
+
+def main():
+  workspace = find_workspace(os.path.dirname(os.path.realpath(__file__)))
+  if not workspace:
+    sys.exit('Must run %s within a workspace.' % os.path.basename(sys.argv[0]))
+
+  if sys.platform.startswith('linux'):
+    bazel = [os.path.join(
+      workspace, 'prebuilts', 'bazel', 'linux-x86_64', 'bazel'
+    )]
+    android_home = f'{workspace}/prebuilts/studio/sdk/linux'
+  elif sys.platform == 'darwin':
+    bazel = [os.path.join(
+        workspace, 'prebuilts', 'bazel', 'darwin-x86_64', 'bazel'
+    )]
+    android_home = f'{workspace}/prebuilts/studio/sdk/darwin'
+  elif sys.platform == 'win32':
+    if plat.machine().lower() in ('arm64', 'aarch64') or os.environ.get('BAZEL_EXE'):
+      bazel = [os.environ.get('BAZEL_EXE', r'C:\Users\ASUS\.gemini\antigravity\scratch\bin\bazel.exe')]
+    else:
+      bazel = [os.path.join(
+          workspace, 'prebuilts', 'bazel', 'windows-x86_64', 'bazel.exe'
+      )]
+    android_home = f'{workspace}/prebuilts/studio/sdk/windows'
+  else:
+    sys.exit('Platform %s is not yet supported.' % sys.platform)
+  if not os.path.exists(android_home):
+    android_home = os.environ.get('ANDROID_HOME')
+
+  # On linux bazel can sometimes hang due to RBE. So we kill it after
+  # BAZEL_INVOCATION_TIMEOUT if set.
+  if sys.platform.startswith('linux') and os.environ.get('BAZEL_INVOCATION_TIMEOUT'):
+    bazel = [
+        'timeout',
+        '-k',
+        '1m',
+        os.environ['BAZEL_INVOCATION_TIMEOUT'],
+    ] + bazel
+
+  args = sys.argv[1:]
+
+  env = os.environ.copy()
+  if android_home:
+    env['ANDROID_HOME'] = android_home
+  elif 'ANDROID_HOME' in env:
+    del env['ANDROID_HOME']
+  if sys.platform == 'darwin':
+    java_path = os.path.join(
+        workspace,
+        'prebuilts',
+        'studio',
+        'jdk',
+        'jbr-next',
+        'mac-arm64' if plat.machine() == 'arm64' else 'mac',
+        'Contents',
+        'Home',
+        'bin',
+    )
+    env['PATH'] = f"{java_path}:{env.get('PATH', '')}"
+    if not os.path.exists('/Library/Developer/CommandLineTools'):
+      print(
+          '/Library/Developer/CommandLineTools does not exist. Please install'
+          ' it with xcode-select --install'
+      )
+      sys.exit(1)
+    # This is needed for bazel to set itself up, even though we aren't using gcc.
+    env['CC'] = os.environ.get('GCC', '/usr/bin/gcc')
+  elif sys.platform == 'win32':
+    win_jdk = 'win-arm64' if plat.machine().lower() in ('arm64', 'aarch64') else 'win'
+    java_path = os.path.join(
+        workspace, 'prebuilts', 'studio', 'jdk', 'jbr-next', win_jdk, 'bin'
+    )
+    env['PATH'] = f"{java_path};{env.get('PATH', '')}"
+    command = bazel_command(args)
+    # We don't need the tools to be installed locally if you're building remotely.
+    # This isn't really the correct check, since --config=remote is just an alias for a bunch of other
+    # settings. But in practice that's how you get into remote mode, so it should be good enough for now
+    # at least.
+    if command in ['build', 'test'] and (
+        not '--config=remote' in args
+        and not '--config=dynamic' in args
+        and not '--config=ci' in args
+    ):
+      if not os.environ.get('BAZEL_VC') and not os.path.exists(
+          'C:\\Program Files (x86)\\Microsoft Visual'
+          ' Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.40.33807'
+      ) and not os.path.exists(
+          'C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC'
+      ):
+        print(
+            'You must have a compatible MSVC installation or set BAZEL_VC.'
+        )
+        sys.exit(1)
+
+    bash_candidates = [
+        os.environ.get('BAZEL_SH', ''),
+        r'C:\Program Files\Git\bin\bash.exe',
+        r'C:\Program Files\Git\usr\bin\bash.exe',
+        r'C:\tools\msys64\usr\bin\bash.exe',
+    ]
+    bash_path = next((b for b in bash_candidates if b and os.path.exists(b)), r'C:\tools\msys64\usr\bin\bash.exe')
+    define_env(
+        env,
+        'BAZEL_SH',
+        bash_path,
+        'Could not find a valid bash installation. Please set BAZEL_SH.',
+    )
+    # Bazel for windows requires a couple of extra env vars be set
+    # SYSTEMROOT must be defined to run a win .exe; otherwise, subprocess.call
+    # will hang.
+    env['SYSTEMROOT'] = 'C:\\Windows'
+
+  else:  # Linux
+    env['CC'] = os.environ.get('GCC', '/usr/bin/gcc')
+
+  sys.exit(subprocess.call(bazel + args, env=env))
+
+
+def define_env(env, var, value, msg=None):
+  prev = os.environ.get(var)
+  if prev:
+    if not os.path.exists(value):
+      print('{} is set to {}, but it does not exist'.format(var, value))
+      sys.exit(1)
+    env[var] = prev
+  elif os.path.exists(value):
+    env[var] = value
+  else:
+    print('Cannot find {} while trying to set "{}"'.format(value, var))
+    if msg:
+      print(msg)
+    else:
+      print(
+          'Make sure {} exists, or set "{}" manually to the correct value.'
+          .format(value, var)
+      )
+    sys.exit(1)
+
+
+def find_workspace(path):
+  if os.path.isfile(os.path.join(path, 'MODULE.bazel')):
+    return path
+  else:
+    parent = os.path.dirname(path)
+    return None if parent == path else find_workspace(parent)
+
+
+def bazel_command_index(args):
+  """Returns the command index, which is the first non-option argument.
+
+  https://bazel.build/versions/master/docs/command-line-reference.html
+  """
+  for i in range(len(args)):
+    if not args[i].startswith('-'):
+      return i
+  return None
+
+
+def bazel_command(args):
+  """Returns the command itself, or None if not defined."""
+  index = bazel_command_index(args)
+  if index is None:
+    return None
+  return args[index]
+
+
+if __name__ == '__main__':
+  main()

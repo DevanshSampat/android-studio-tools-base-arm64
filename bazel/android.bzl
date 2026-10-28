@@ -1,0 +1,149 @@
+"""Android rules"""
+
+load("@rules_android//providers:providers.bzl", "AndroidLibraryResourceClassJarProvider")
+load("@rules_android//rules:android_split_transition.bzl", "android_split_transition")
+load("@rules_java//java:defs.bzl", "JavaInfo")
+
+def _jni_library_impl(ctx):
+    inputs = []
+    for cpu, deps in ctx.split_attr.deps.items():
+        if not cpu:
+            # --fat_apk_cpu wasn't used, so the dependencies were compiled using the
+            # cpu value from --cpu, so use that as the directory name.
+            cpu = ctx.fragments.cpp.cpu
+        for dep in deps:
+            for f in dep.files.to_list():
+                inputs.append((cpu, f))
+
+    # If two targets in deps share the same files (e.g. in the data attribute)
+    # they would be included mulitple times in the same path in the zip, so
+    # dedupe the files.
+    deduped_inputs = depset(inputs)
+    zipper_args = ["c", ctx.outputs.zip.path]
+    for cpu, file in deduped_inputs.to_list():
+        # "lib/" is the JNI directory looked for in android
+        target = "lib/%s/%s" % (cpu, file.basename)
+
+        # Using bazel stripping convention
+        # https://docs.bazel.build/versions/master/be/c-cpp.html#cc_binary
+        if target.endswith(".stripped"):
+            target = target[:-9]
+        name = target + "=" + file.path
+        zipper_args.append(name)
+
+    ctx.actions.run(
+        inputs = [f for cpu, f in deduped_inputs.to_list()],
+        outputs = [ctx.outputs.zip],
+        executable = ctx.executable._zipper,
+        arguments = zipper_args,
+        progress_message = "Creating zip...",
+        mnemonic = "zipper",
+    )
+
+def _android_cc_binary_stub_impl(ctx):
+    for out in ctx.outputs.outs:
+        ctx.actions.write(out, "#!/bin/sh\nexit 0\n")
+    return [DefaultInfo(files = depset(ctx.outputs.outs))]
+
+_android_cc_binary = rule(
+    attrs = {
+        "filename": attr.string(),
+        "outs": attr.output_list(),
+    },
+    implementation = _android_cc_binary_stub_impl,
+)
+
+def _aar_to_jar_impl(ctx):
+    jars = []
+    for aar in ctx.attr.aars:
+        jars.append(aar[JavaInfo].java_outputs[0].class_jar)
+    return [DefaultInfo(files = depset(jars))]
+
+_aars_to_jars = rule(
+    attrs = {
+        "aars": attr.label_list(
+            providers = [[AndroidLibraryResourceClassJarProvider, JavaInfo]],
+        ),
+    },
+    implementation = _aar_to_jar_impl,
+)
+
+def android_cc_binary(name, binary, filename, **kwargs):
+    outs = []
+
+    # This is tightly coupled to the value given to --android_platforms because it uses
+    # transitions based the given platforms.
+    # LINT.IfChange(android_platforms)
+    for abi in ["x86", "x86_64", "armeabi-v7a", "arm64-v8a"]:
+        # LINT.ThenChange(/bazel/common.bazelrc:android_platforms)
+        outs.append(name + "/" + abi + "/" + filename)
+    kwargs.pop("target_compatible_with", None)
+    _android_cc_binary(
+        name = name,
+        filename = filename,
+        outs = outs,
+        **kwargs
+    )
+
+jni_library = rule(
+    attrs = {
+        "deps": attr.label_list(
+            cfg = android_split_transition,
+            allow_files = True,
+        ),
+        "_zipper": attr.label(
+            default = Label("@bazel_tools//tools/zip:zipper"),
+            cfg = "exec",
+            executable = True,
+        ),
+    },
+    fragments = ["cpp"],
+    outputs = {"zip": "%{name}.jar"},
+    implementation = _jni_library_impl,
+)
+
+def select_android(android, default = []):
+    return select({
+        "@platforms//os:android": android,
+        "//conditions:default": default,
+    })
+
+def dex_library(name, jars = [], aars = [], output = None, visibility = None, tags = [], flags = []):
+    if aars:
+        _aars_to_jars(
+            name = name + "_aar_jars",
+            aars = aars,
+        )
+        jars = jars + [":" + name + "_aar_jars"]
+
+    native.genrule(
+        name = name,
+        srcs = jars,
+        outs = [output] if output != None else [name + ".jar"],
+        visibility = visibility,
+        tags = tags,
+        cmd = "$(location //prebuilts/r8:d8) --output ./$@ " + " ".join(flags) + " ./$(SRCS)",
+        tools = ["//prebuilts/r8:d8"],
+    )
+
+ANDROID_COPTS = select_android(
+    [
+        "-fPIC",
+        "-std=c++17",
+        "-flto",
+    ],
+)
+
+ANDROID_LINKOPTS = select_android(
+    [
+        "-llog",
+        "-latomic",
+        "-lm",
+        "-ldl",
+        "-pie",
+        "-Wl,--gc-sections",
+        "-Wl,--as-needed",
+        "-Wl,-z,max-page-size=16384",
+        "-flto",
+    ],
+)

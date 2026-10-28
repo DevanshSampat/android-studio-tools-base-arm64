@@ -1,0 +1,19 @@
+# android_ndk = use_extension("@rules_android_ndk//:extension.bzl", "android_ndk_repository_extension")
+# android_ndk.configure(
+#     api_level = 27,
+# )
+# use_repo(android_ndk, "androidndk")
+# 
+# register_toolchains("@androidndk//:all")
+
+# ASwB test deps are in a different directory for ownership.
+include("//tools/adt/idea/aswb/testing/test_deps:test_deps.MODULE.bazel")
+
+# Journeys evals test artifacts (Google internal - skipped in open source)
+# include("//tools/vendor/google/ml/aiplugin/android/journeys-evals:test_artifacts.MODULE.bazel")
+
+# Android Bench test artifacts (Google internal - skipped in open source)
+# include("//tools/vendor/google/ml/aiplugin/android/eval:bench_repos.MODULE.bazel")
+
+# Project baremetal golang configuration (Google internal - skipped in open source)
+# include("//tools/vendor/adt_infra_internal/baremetal:baremetal.MODULE.bazel")
